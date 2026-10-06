@@ -88,6 +88,42 @@ function sendXml(res, code, xml) {
   res.end('<?xml version="1.0" encoding="UTF-8"?>' + xml);
 }
 
+const rejected = [];   // newest first
+const isDate = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !isNaN(Date.parse(v)) &&
+  new Date(v + 'T00:00:00Z').toISOString().slice(0, 10) === v;
+const PAYMENT_MODES = ['UPI', 'CARD', 'CASH'];
+
+function validateSalesJson(b) {
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return ['Body must be a JSON object'];
+  const e = [];
+  if (!String(b.storeId || '').trim()) e.push('storeId is required');
+  if (!isDate(b.reportDate)) e.push('reportDate must be a valid yyyy-MM-dd date');
+  if (typeof b.totalRevenue !== 'number' || b.totalRevenue < 0) e.push('totalRevenue must be a non-negative number');
+  return e;
+}
+
+function validateSalesXml(x) {
+  const e = [];
+  if (!/^\s*(<\?xml[^>]*\?>\s*)?<SalesReport[\s>]/.test(x)) return ['Root element must be <SalesReport>'];
+  if (!xmlTag(x, 'StoreID')) e.push('StoreID is required');
+  if (!isDate(xmlTag(x, 'ReportDate'))) e.push('ReportDate must be a valid yyyy-MM-dd date');
+  const txns = [...x.matchAll(/<Transaction>([\s\S]*?)<\/Transaction>/g)].map((m) => m[1]);
+  if (!txns.length) e.push('At least one <Transaction> is required');
+  const seen = new Set();
+  txns.forEach((t, i) => {
+    const id = xmlTag(t, 'TxnID');
+    const label = id || '#' + (i + 1);
+    if (!id) e.push('Transaction #' + (i + 1) + ': TxnID is required');
+    else if (seen.has(id)) e.push('Duplicate TxnID ' + id);
+    seen.add(id);
+    const qty = xmlTag(t, 'Qty'), price = xmlTag(t, 'UnitPrice');
+    if (!/^\d+$/.test(qty) || parseInt(qty, 10) <= 0) e.push('Invalid Qty in ' + label);
+    if (!/^\d+(\.\d+)?$/.test(price) || parseFloat(price) <= 0) e.push('Invalid UnitPrice in ' + label);
+    if (!PAYMENT_MODES.includes(xmlTag(t, 'PaymentMode').toUpperCase())) e.push('Invalid PaymentMode in ' + label);
+  });
+  return e;
+}
+
 async function handleApi(req, res, name) {
   if (!checkBearer(req, res)) return;
   const ct = (req.headers['content-type'] || '').toLowerCase();
@@ -96,16 +132,30 @@ async function handleApi(req, res, name) {
   if (!isJson && !isXml) return send(res, 415, { error: 'Content-Type must be application/json or application/xml' });
 
   const raw = await readBody(req);
-  const fail = (code, msg) => isXml ? sendXml(res, code, `<Error><Message>${esc(msg)}</Message></Error>`) : send(res, code, { error: msg });
+  const reject = (code, message, details) => {
+    rejected.unshift({ endpoint: '/' + name, format: isXml ? 'XML' : 'JSON', receivedAt: new Date().toISOString(),
+      status: code, reasons: details || [message], sample: raw.slice(0, 300) });
+    if (rejected.length > MAX_STORED) rejected.pop();
+    if (isXml) {
+      const d = (details || []).map((x) => `<Detail>${esc(x)}</Detail>`).join('');
+      return sendXml(res, code, `<Error><Message>${esc(message)}</Message>${d ? '<Details>' + d + '</Details>' : ''}</Error>`);
+    }
+    return send(res, code, details ? { error: message, details } : { error: message });
+  };
+
+  if (!raw.trim()) return reject(400, 'No payload received');
+
   let body;
   if (isJson) {
-    try { body = JSON.parse(raw); } catch { return fail(400, 'Malformed JSON'); }
-    if (name === 'sales-report' && (!body || !body.storeId)) return fail(422, 'storeId is required');
+    try { body = JSON.parse(raw); } catch { return reject(400, 'Malformed JSON'); }
   } else {
     const problem = xmlProblem(raw);
-    if (problem) return fail(400, 'Malformed XML: ' + problem);
+    if (problem) return reject(400, 'Malformed XML: ' + problem);
     body = raw.trim();
-    if (name === 'sales-report' && !(xmlTag(raw, 'storeId') || xmlTag(raw, 'StoreID'))) return fail(422, 'storeId is required');
+  }
+  if (name === 'sales-report') {
+    const errors = isJson ? validateSalesJson(body) : validateSalesXml(raw);
+    if (errors.length) return reject(422, 'Validation failed', errors);
   }
   const entry = {
     receiptId: 'RCPT-' + crypto.randomBytes(4).toString('hex').toUpperCase(),
@@ -130,12 +180,15 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 function viewer(res) {
   const rows = received.map((e) => `<div class="c"><b>${esc(e.endpoint)}</b> &middot; ${esc(e.format || 'JSON')} &middot; ${esc(e.receiptId)} &middot; ${esc(e.receivedAt)}
 <pre>${esc(typeof e.body === 'string' ? e.body : JSON.stringify(e.body, null, 2))}</pre></div>`).join('') || '<p>No requests yet.</p>';
+  const rejRows = rejected.map((r) => `<div class="c bad"><b>${esc(r.endpoint)}</b> &middot; ${esc(r.format)} &middot; HTTP ${r.status} &middot; ${esc(r.receivedAt)}
+<ul>${r.reasons.map((x) => '<li>' + esc(x) + '</li>').join('')}</ul></div>`).join('') || '<p>None.</p>';
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="3"><title>Received payloads</title>
 <style>body{font:14px Arial,sans-serif;margin:16px auto;max-width:900px;padding:0 16px}
-.c{border:1px solid #ccc;border-radius:6px;padding:10px;margin:10px 0}pre{background:#f4f4f4;padding:8px;overflow:auto}</style>
-<h2>Received payloads (${received.length})</h2><p>Auto-refreshes every 3 seconds. <a href="/clear">Clear</a></p>${rows}`);
+.bad{border-color:#c0392b!important;background:#fdecea}.c{border:1px solid #ccc;border-radius:6px;padding:10px;margin:10px 0}pre{background:#f4f4f4;padding:8px;overflow:auto}</style>
+<h2>Received payloads (${received.length})</h2><p>Auto-refreshes every 3 seconds. <a href="/clear">Clear</a></p>${rows}
+<h2>Rejected requests (${rejected.length})</h2>${rejRows}`);
 }
 
 http.createServer(async (req, res) => {
@@ -149,7 +202,7 @@ http.createServer(async (req, res) => {
     if (req.method === 'POST' && m) return await handleApi(req, res, m[1]);
     if (req.method === 'GET' && p === '/received') return viewer(res);
     if (req.method === 'GET' && p === '/received.json') return send(res, 200, received);
-    if (req.method === 'GET' && p === '/clear') { received.length = 0; res.writeHead(302, { Location: '/received' }); return res.end(); }
+    if (req.method === 'GET' && p === '/clear') { received.length = 0; rejected.length = 0; res.writeHead(302, { Location: '/received' }); return res.end(); }
     send(res, 404, { error: 'Not found' });
   } catch (e) {
     send(res, 500, { error: 'Server error' });
