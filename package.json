@@ -1,0 +1,9 @@
+{
+  "name": "cpi-demo-target",
+  "version": "1.0.0",
+  "description": "OAuth2 client-credentials protected JSON mock target for SAP CPI demos",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
